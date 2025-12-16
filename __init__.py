@@ -4,7 +4,7 @@ import urllib.request
 
 from fiftyone.operators import types
 
-from sharp.zoo import SHARPModel, SHARPConfig
+from .zoo import SHARPModel, SHARPConfig
 
 logger = logging.getLogger(__name__)
 
