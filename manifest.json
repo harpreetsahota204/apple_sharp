@@ -10,7 +10,7 @@
             "source": "https://huggingface.co/apple/Sharp",
             "description": "SHARP is an approach to photorealistic view synthesis from a single image. Given a single photograph, SHARP regresses the parameters of a 3D Gaussian representation of the depicted scene.",
             "tags": [
-                "threed",
+                "threed"
             ],
             "date_added": "2025-12-16",
             "requirements": {
