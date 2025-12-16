@@ -1,12 +1,10 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
 from plyfile import PlyData, PlyElement
 
 import fiftyone as fo
@@ -16,7 +14,9 @@ from fiftyone.utils.torch import GetItem
 
 # SHARP model imports (install via: pip install git+https://github.com/apple/ml-sharp#egg=sharp)
 from sharp.models import PredictorParams, create_predictor
-from sharp.utils.gaussians import Gaussians3D, save_ply, unproject_gaussians
+from sharp.utils.gaussians import save_ply
+from sharp.utils.io import load_rgb
+from sharp.cli.predict import predict_image
 
 logger = logging.getLogger(__name__)
 
@@ -143,61 +143,18 @@ def convert_3dgs_ply(input_path: Path, output_path: Optional[Path] = None) -> Pa
 
 
 class SHARPGetItem(GetItem):
-    """Data loader transform for SHARP model."""
+    """Data loader transform for SHARP model. Just passes filepath to predict_all."""
 
-    def __init__(self, field_mapping: Optional[Dict[str, str]] = None, default_focal_length_mm: float = 30.0):
+    def __init__(self, field_mapping: Optional[Dict[str, str]] = None):
         super().__init__(field_mapping=field_mapping)
-        self.default_focal_length_mm = default_focal_length_mm
 
     @property
     def required_keys(self) -> List[str]:
         return ["filepath"]
 
     def __call__(self, sample_dict: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Load image and extract metadata."""
-        filepath = sample_dict["filepath"]
-
-        try:
-            image = Image.open(filepath)
-            image = self._apply_exif_orientation(image)
-            image = image.convert("RGB")
-            focal_length_px = self._extract_focal_length(image)
-
-            return {
-                "image": image,
-                "filepath": filepath,
-                "original_size": image.size,
-                "focal_length_px": focal_length_px,
-            }
-        except Exception as e:
-            logger.warning(f"Failed to load {filepath}: {e}")
-            return None
-
-    def _apply_exif_orientation(self, image: Image.Image) -> Image.Image:
-        """Apply EXIF orientation to image."""
-        try:
-            orientation = image.getexif().get(274)
-            rotations = {3: Image.ROTATE_180, 6: Image.ROTATE_270, 8: Image.ROTATE_90}
-            if orientation in rotations:
-                image = image.transpose(rotations[orientation])
-        except Exception:
-            pass
-        return image
-
-    def _extract_focal_length(self, image: Image.Image) -> float:
-        """Extract focal length in pixels from EXIF or use default."""
-        width, height = image.size
-        f_mm = self.default_focal_length_mm
-
-        try:
-            exif_ifd = image.getexif().get_ifd(0x8769)
-            f_mm = exif_ifd.get(41989) or exif_ifd.get(37386) or self.default_focal_length_mm
-            if f_mm < 10.0:
-                f_mm *= 8.4  # Crude conversion for non-35mm equivalent
-        except Exception:
-            pass
-
-        return float(f_mm * np.sqrt(width**2 + height**2) / np.sqrt(36**2 + 24**2))
+        """Just return filepath - SHARP's load_rgb handles the rest."""
+        return {"filepath": sample_dict["filepath"]}
 
 
 class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
@@ -266,105 +223,36 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
 
     # Methods from SupportsGetItem
     def build_get_item(self, field_mapping: Optional[Dict[str, str]] = None) -> GetItem:
-        return SHARPGetItem(field_mapping=field_mapping, default_focal_length_mm=self.config.default_focal_length_mm)
+        return SHARPGetItem(field_mapping=field_mapping)
 
     def predict(self, arg) -> Optional[str]:
-        """Process a single sample."""
-        if isinstance(arg, np.ndarray):
-            arg = Image.fromarray(arg)
-
-        if isinstance(arg, Image.Image):
-            arg = {
-                "image": arg,
-                "filepath": "unnamed_image.jpg",
-                "original_size": arg.size,
-                "focal_length_px": self.config.default_focal_length_mm * np.sqrt(arg.size[0]**2 + arg.size[1]**2) / np.sqrt(36**2 + 24**2),
-            }
-
-        results = self.predict_all([arg])
-        return results[0] if results else None
+        """Process a single sample. Expects dict with 'filepath' key."""
+        if isinstance(arg, dict):
+            results = self.predict_all([arg])
+            return results[0] if results else None
+        # If given a filepath string directly
+        if isinstance(arg, (str, Path)):
+            results = self.predict_all([{"filepath": str(arg)}])
+            return results[0] if results else None
+        raise ValueError("predict() expects a dict with 'filepath' or a filepath string")
 
     def predict_all(self, batch: List[Optional[Dict[str, Any]]]) -> List[Optional[str]]:
-        """Process a batch of images."""
-        # Filter valid items and track indices
-        valid_items = [(i, item) for i, item in enumerate(batch) if item is not None]
-        
-        if not valid_items:
-            return [None] * len(batch)
-
-        indices, valid_batch = zip(*valid_items)
-
-        # Preprocess
-        images_tensor, disparity_factors, metadata = self._preprocess_batch(list(valid_batch))
-
-        # Inference
-        with torch.no_grad():
-            gaussians_ndc = self._model(images_tensor, disparity_factors)
-
-        # Post-process
-        valid_results = self._postprocess_batch(gaussians_ndc, metadata)
-
-        # Map results back
-        results = [None] * len(batch)
-        for i, result in zip(indices, valid_results):
-            results[i] = result
-
-        return results
-
-    def _preprocess_batch(self, batch: List[Dict[str, Any]]) -> Tuple[torch.Tensor, torch.Tensor, List[Dict[str, Any]]]:
-        """Prepare batch for SHARP inference."""
-        images_list = []
-        disparity_factors_list = []
-        metadata = []
-
-        for item in batch:
-            image = item["image"]
-            width, height = item["original_size"]
-            f_px = item["focal_length_px"]
-
-            # Convert and resize
-            image_pt = torch.from_numpy(np.array(image).copy()).float().to(self._device).permute(2, 0, 1) / 255.0
-            image_resized = F.interpolate(image_pt.unsqueeze(0), size=INTERNAL_SHAPE, mode="bilinear", align_corners=True).squeeze(0)
-
-            images_list.append(image_resized)
-            disparity_factors_list.append(f_px / width)
-            metadata.append({"filepath": item["filepath"], "width": width, "height": height, "f_px": f_px})
-
-        return (
-            torch.stack(images_list),
-            torch.tensor(disparity_factors_list, dtype=torch.float32, device=self._device),
-            metadata,
-        )
-
-    def _postprocess_batch(self, gaussians_ndc: Gaussians3D, metadata: List[Dict[str, Any]]) -> List[Optional[str]]:
-        """Convert batched Gaussians to fo3d files."""
+        """Process a batch of images using SHARP's predict_image."""
         results = []
 
-        for i, meta in enumerate(metadata):
-            filepath = meta["filepath"]
-            width, height, f_px = meta["width"], meta["height"], meta["f_px"]
+        for item in batch:
+            if item is None:
+                results.append(None)
+                continue
 
-            # Extract single image from batch
-            gaussians_i = Gaussians3D(
-                mean_vectors=gaussians_ndc.mean_vectors[i:i+1],
-                singular_values=gaussians_ndc.singular_values[i:i+1],
-                quaternions=gaussians_ndc.quaternions[i:i+1],
-                colors=gaussians_ndc.colors[i:i+1],
-                opacities=gaussians_ndc.opacities[i:i+1],
-            )
+            filepath = item["filepath"]
+            
+            # Use SHARP's load_rgb to get image and focal length (same as CLI)
+            image, _, f_px = load_rgb(Path(filepath))
+            height, width = image.shape[:2]
 
-            # Compute and scale intrinsics
-            intrinsics = torch.tensor([
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ], dtype=torch.float32, device=self._device)
-            intrinsics[0] *= INTERNAL_SHAPE[0] / width
-            intrinsics[1] *= INTERNAL_SHAPE[1] / height
-
-            # Unproject
-            gaussians = unproject_gaussians(gaussians_i, torch.eye(4, device=self._device), intrinsics, INTERNAL_SHAPE)
+            # Use SHARP's predict_image (same as CLI)
+            gaussians = predict_image(self._model, image, f_px, self._device)
 
             # Output paths
             source_path = Path(filepath)
@@ -387,7 +275,6 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
             scene = fo.Scene()
             scene.camera = fo.PerspectiveCamera(up="Z")
             mesh = fo.PlyMesh("mesh", str(rgb_ply_path), is_point_cloud=True)
-            # mesh.rotation = fo.Euler(90, 0, 0, degrees=True)
             scene.add(mesh)
             scene.write(str(fo3d_path))
 
