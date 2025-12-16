@@ -51,8 +51,6 @@ def load_model(
     model_path, 
     device="auto",
     output_dir=None,
-    save_3dgs_ply=True,
-    default_focal_length_mm=30.0,
     **kwargs
 ):
     """Loads the SHARP model.
@@ -62,8 +60,6 @@ def load_model(
         model_path: the absolute filename to which the model was downloaded
         device: device to run inference on ("auto", "cuda", "cpu", "mps")
         output_dir: directory for output files (None = alongside source images)
-        save_3dgs_ply: whether to save original 3DGS PLY format
-        default_focal_length_mm: fallback focal length if EXIF missing
         **kwargs: additional keyword arguments
         
     Returns:
@@ -79,8 +75,6 @@ def load_model(
         model_path=model_path,
         device=device,
         output_dir=output_dir,
-        save_3dgs_ply=save_3dgs_ply,
-        default_focal_length_mm=default_focal_length_mm,
     )
     
     return SHARPModel(config)
@@ -111,20 +105,6 @@ def resolve_input(model_name, ctx):
         default="auto",
         label="Device",
         description="Device to run inference on"
-    )
-    
-    inputs.bool(
-        "save_3dgs_ply",
-        default=True,
-        label="Save 3DGS PLY",
-        description="Whether to save original 3DGS PLY format (for use with other renderers)"
-    )
-    
-    inputs.float(
-        "default_focal_length_mm",
-        default=30.0,
-        label="Default Focal Length (mm)",
-        description="Fallback focal length (35mm equivalent) if EXIF data is missing"
     )
     
     return types.Property(inputs)
