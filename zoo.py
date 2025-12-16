@@ -13,10 +13,10 @@ from fiftyone.core.models import SupportsGetItem, TorchModelMixin
 from fiftyone.utils.torch import GetItem
 
 # SHARP model imports (install via: pip install git+https://github.com/apple/ml-sharp#egg=sharp)
+import torch.nn.functional as F
 from sharp.models import PredictorParams, create_predictor
-from sharp.utils.gaussians import save_ply
+from sharp.utils.gaussians import Gaussians3D, save_ply, unproject_gaussians
 from sharp.utils.io import load_rgb
-from sharp.cli.predict import predict_image
 
 logger = logging.getLogger(__name__)
 
@@ -31,20 +31,10 @@ class SHARPConfig:
     model_path: Optional[str] = None
     device: str = "auto"
     output_dir: Optional[str] = None
-    save_3dgs_ply: bool = True
-    default_focal_length_mm: float = 30.0
 
 
-def sigmoid(x: np.ndarray) -> np.ndarray:
-    """Numerically stable sigmoid function."""
-    return np.where(x >= 0, 1 / (1 + np.exp(-x)), np.exp(x) / (1 + np.exp(x)))
-
-
-def convert_3dgs_ply(input_path: Path, output_path: Optional[Path] = None) -> Path:
-    """Convert 3DGS PLY to standard PLY with RGB colors for FiftyOne viewer.
-    
-    Preserves all original 3DGS properties for round-trip compatibility.
-    """
+def convert_3dgs_ply(input_path: Path, output_path: Path = None) -> Path:
+    """Convert 3DGS PLY to standard PLY with RGB colors (proven fast approach)."""
     input_path = Path(input_path)
     output_path = output_path or input_path.with_stem(f"{input_path.stem}_rgb")
 
@@ -53,91 +43,63 @@ def convert_3dgs_ply(input_path: Path, output_path: Optional[Path] = None) -> Pa
     props = [p.name for p in vertices.properties]
     n_points = len(vertices["x"])
 
-    # Build output dtype - position and RGB first
+    # Build dtype - position and RGB first
     dtype_fields = [("x", "f4"), ("y", "f4"), ("z", "f4")]
     dtype_fields.extend([("red", "u1"), ("green", "u1"), ("blue", "u1")])
 
-    # Alpha if opacity exists
     has_opacity = "opacity" in props
     if has_opacity:
         dtype_fields.append(("alpha", "u1"))
 
-    # Scale as normals (nx, ny, nz)
     has_scale = all(f"scale_{i}" in props for i in range(3))
     if has_scale:
         dtype_fields.extend([("nx", "f4"), ("ny", "f4"), ("nz", "f4")])
 
-    # Rotation quaternion
     has_rotation = all(f"rot_{i}" in props for i in range(4))
     if has_rotation:
         dtype_fields.extend([("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4")])
 
-    # Higher order SH (f_rest_*)
     sh_rest_props = sorted([p for p in props if p.startswith("f_rest_")])
     for prop in sh_rest_props:
         dtype_fields.append((prop, "f4"))
 
-    # Original f_dc_* for round-trip
     dtype_fields.extend([("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4")])
 
-    # Original opacity and scale for round-trip
     if has_opacity:
         dtype_fields.append(("opacity_raw", "f4"))
     if has_scale:
         dtype_fields.extend([("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4")])
 
-    # Create output array
     out = np.zeros(n_points, dtype=dtype_fields)
 
     # Position
-    out["x"] = vertices["x"]
-    out["y"] = vertices["y"]
-    out["z"] = vertices["z"]
+    out["x"], out["y"], out["z"] = vertices["x"], vertices["y"], vertices["z"]
 
-    # Convert SH DC to RGB
-    f_dc_0 = np.asarray(vertices["f_dc_0"]) if "f_dc_0" in props else np.zeros(n_points)
-    f_dc_1 = np.asarray(vertices["f_dc_1"]) if "f_dc_1" in props else np.zeros(n_points)
-    f_dc_2 = np.asarray(vertices["f_dc_2"]) if "f_dc_2" in props else np.zeros(n_points)
+    # SH DC to RGB
+    f_dc_0 = vertices["f_dc_0"] if "f_dc_0" in props else np.zeros(n_points)
+    f_dc_1 = vertices["f_dc_1"] if "f_dc_1" in props else np.zeros(n_points)
+    f_dc_2 = vertices["f_dc_2"] if "f_dc_2" in props else np.zeros(n_points)
 
     out["red"] = np.clip((0.5 + SH_C0 * f_dc_0) * 255, 0, 255).astype(np.uint8)
     out["green"] = np.clip((0.5 + SH_C0 * f_dc_1) * 255, 0, 255).astype(np.uint8)
     out["blue"] = np.clip((0.5 + SH_C0 * f_dc_2) * 255, 0, 255).astype(np.uint8)
+    out["f_dc_0"], out["f_dc_1"], out["f_dc_2"] = f_dc_0, f_dc_1, f_dc_2
 
-    # Store original SH DC
-    out["f_dc_0"] = f_dc_0
-    out["f_dc_1"] = f_dc_1
-    out["f_dc_2"] = f_dc_2
-
-    # Opacity -> Alpha
     if has_opacity:
-        opacity_raw = np.asarray(vertices["opacity"])
-        out["alpha"] = np.clip(sigmoid(opacity_raw) * 255, 0, 255).astype(np.uint8)
+        opacity_raw = vertices["opacity"]
+        out["alpha"] = np.clip(1 / (1 + np.exp(-opacity_raw)) * 255, 0, 255).astype(np.uint8)
         out["opacity_raw"] = opacity_raw
 
-    # Scale (stored as log, convert to exp for normals)
     if has_scale:
-        scale_0 = np.asarray(vertices["scale_0"])
-        scale_1 = np.asarray(vertices["scale_1"])
-        scale_2 = np.asarray(vertices["scale_2"])
-        out["nx"] = np.exp(scale_0)
-        out["ny"] = np.exp(scale_1)
-        out["nz"] = np.exp(scale_2)
-        out["scale_0"] = scale_0
-        out["scale_1"] = scale_1
-        out["scale_2"] = scale_2
+        out["nx"], out["ny"], out["nz"] = np.exp(vertices["scale_0"]), np.exp(vertices["scale_1"]), np.exp(vertices["scale_2"])
+        out["scale_0"], out["scale_1"], out["scale_2"] = vertices["scale_0"], vertices["scale_1"], vertices["scale_2"]
 
-    # Rotation quaternion
     if has_rotation:
-        out["rot_0"] = vertices["rot_0"]
-        out["rot_1"] = vertices["rot_1"]
-        out["rot_2"] = vertices["rot_2"]
-        out["rot_3"] = vertices["rot_3"]
+        out["rot_0"], out["rot_1"], out["rot_2"], out["rot_3"] = vertices["rot_0"], vertices["rot_1"], vertices["rot_2"], vertices["rot_3"]
 
-    # Higher order SH
     for prop in sh_rest_props:
         out[prop] = vertices[prop]
 
-    # Write output
     PlyData([PlyElement.describe(out, "vertex")], text=False).write(str(output_path))
     return output_path
 
@@ -191,6 +153,19 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
         logger.info(f"SHARP model loaded on {self._device}")
         return predictor
 
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+    
+    def __exit__(self, *args):
+        """Context manager exit - clear GPU memory cache."""
+        # Clear cache based on device type (don't move model to CPU)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        return False
+
     # Properties from Model base class
     @property
     def media_type(self) -> str:
@@ -237,47 +212,97 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
         raise ValueError("predict() expects a dict with 'filepath' or a filepath string")
 
     def predict_all(self, batch: List[Optional[Dict[str, Any]]]) -> List[Optional[str]]:
-        """Process a batch of images using SHARP's predict_image."""
-        results = []
+        """Process a batch of images with batched forward pass."""
+        # Track valid items
+        valid_indices = []
+        images_tensors = []
+        disparity_factors = []
+        metadata = []
 
-        for item in batch:
+        for i, item in enumerate(batch):
             if item is None:
-                results.append(None)
                 continue
 
             filepath = item["filepath"]
             
-            # Use SHARP's load_rgb to get image and focal length (same as CLI)
+            # Use SHARP's load_rgb (same as CLI)
             image, _, f_px = load_rgb(Path(filepath))
             height, width = image.shape[:2]
 
-            # Use SHARP's predict_image (same as CLI)
-            gaussians = predict_image(self._model, image, f_px, self._device)
+            # Preprocess (same as predict_image)
+            image_pt = torch.from_numpy(image.copy()).float().to(self._device).permute(2, 0, 1) / 255.0
+            image_resized = F.interpolate(image_pt.unsqueeze(0), size=INTERNAL_SHAPE, mode="bilinear", align_corners=True).squeeze(0)
 
-            # Output paths
-            source_path = Path(filepath)
-            output_dir = Path(self.config.output_dir) if self.config.output_dir else source_path.parent
+            valid_indices.append(i)
+            images_tensors.append(image_resized)
+            disparity_factors.append(f_px / width)
+            metadata.append({"filepath": filepath, "width": width, "height": height, "f_px": f_px})
+
+        # Initialize results
+        results = [None] * len(batch)
+        
+        if not valid_indices:
+            return results
+
+        # Batched forward pass
+        images_batch = torch.stack(images_tensors)
+        disparity_batch = torch.tensor(disparity_factors, dtype=torch.float32, device=self._device)
+
+        with torch.no_grad():
+            gaussians_ndc = self._model(images_batch, disparity_batch)
+
+        # Post-process each result using SHARP's unproject_gaussians
+        for idx, (orig_idx, meta) in enumerate(zip(valid_indices, metadata)):
+            filepath = meta["filepath"]
+            width, height, f_px = meta["width"], meta["height"], meta["f_px"]
+
+            # Extract single result from batch
+            gaussians_i = Gaussians3D(
+                mean_vectors=gaussians_ndc.mean_vectors[idx:idx+1],
+                singular_values=gaussians_ndc.singular_values[idx:idx+1],
+                quaternions=gaussians_ndc.quaternions[idx:idx+1],
+                colors=gaussians_ndc.colors[idx:idx+1],
+                opacities=gaussians_ndc.opacities[idx:idx+1],
+            )
+
+            # Compute intrinsics (same as predict_image)
+            intrinsics = torch.tensor([
+                [f_px, 0, width / 2, 0],
+                [0, f_px, height / 2, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ], dtype=torch.float32, device=self._device)
+            intrinsics[0] *= INTERNAL_SHAPE[0] / width
+            intrinsics[1] *= INTERNAL_SHAPE[1] / height
+
+            # Unproject using SHARP's function (same as predict_image)
+            gaussians = unproject_gaussians(
+                gaussians_i, 
+                torch.eye(4, device=self._device), 
+                intrinsics, 
+                INTERNAL_SHAPE
+            )
+
+            # Output paths (use absolute paths for fo3d compatibility)
+            source_path = Path(filepath).resolve()
+            output_dir = Path(self.config.output_dir).resolve() if self.config.output_dir else source_path.parent
             output_dir.mkdir(parents=True, exist_ok=True)
 
             stem = source_path.stem
             ply_path = output_dir / f"{stem}_sharp.ply"
-            rgb_ply_path = output_dir / f"{stem}_sharp_rgb.ply"
             fo3d_path = output_dir / f"{stem}_sharp.fo3d"
 
-            # Save PLY and convert
+            # Use SHARP's save_ply, then convert in-place (saves disk space)
             save_ply(gaussians, f_px, (height, width), ply_path)
-            convert_3dgs_ply(ply_path, rgb_ply_path)
-
-            if not self.config.save_3dgs_ply:
-                ply_path.unlink()
+            convert_3dgs_ply(ply_path, ply_path)  # Overwrites with RGB version
 
             # Create fo3d scene
             scene = fo.Scene()
             scene.camera = fo.PerspectiveCamera(up="Z")
-            mesh = fo.PlyMesh("mesh", str(rgb_ply_path), is_point_cloud=True)
+            mesh = fo.PlyMesh("mesh", str(ply_path), is_point_cloud=True)
             scene.add(mesh)
             scene.write(str(fo3d_path))
 
-            results.append(str(fo3d_path))
+            results[orig_idx] = str(fo3d_path)
 
         return results
