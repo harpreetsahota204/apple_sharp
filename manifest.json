@@ -1,0 +1,27 @@
+{
+    "name": "SHARP",
+    "url": "https://github.com/harpreetsahota204/apple_sharp",
+    "models": [
+        {
+            "base_name": "Apple/SHARP",
+            "base_filename":"SHARP",
+            "author": "Apple",
+            "license": "Apple Model License for Research",
+            "source": "https://huggingface.co/apple/Sharp",
+            "description": "SHARP is an approach to photorealistic view synthesis from a single image. Given a single photograph, SHARP regresses the parameters of a 3D Gaussian representation of the depicted scene.",
+            "tags": [
+                "threed",
+            ],
+            "date_added": "2025-12-16",
+            "requirements": {
+                "packages": ["sharp@git+https://github.com/apple/ml-sharp", "torch", "torchvision"],
+                "cpu": {
+                    "support": true
+                },
+                "gpu": {
+                    "support": true
+                }
+            }
+        }
+    ]
+}
