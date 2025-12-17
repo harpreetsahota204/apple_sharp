@@ -289,8 +289,8 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
             output_dir.mkdir(parents=True, exist_ok=True)
 
             stem = source_path.stem
-            ply_path = output_dir / f"{stem}_sharp.ply"
-            fo3d_path = output_dir / f"{stem}_sharp.fo3d"
+            ply_path = output_dir / f"{stem}.ply"
+            fo3d_path = output_dir / f"{stem}.fo3d"
 
             # Use SHARP's save_ply, then convert in-place (saves disk space)
             save_ply(gaussians, f_px, (height, width), ply_path)
@@ -298,7 +298,7 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
 
             # Create fo3d scene
             scene = fo.Scene()
-            scene.camera = fo.PerspectiveCamera(up="Z")
+            scene.camera = fo.PerspectiveCamera(up="-Y")
             mesh = fo.PlyMesh("mesh", str(ply_path), is_point_cloud=True)
             scene.add(mesh)
             scene.write(str(fo3d_path))
