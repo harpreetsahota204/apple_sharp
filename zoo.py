@@ -265,10 +265,10 @@ class SHARPModel(Model, SupportsGetItem, TorchModelMixin):
                 opacities=gaussians_ndc.opacities[idx:idx+1],
             )
 
-            # Compute intrinsics (same as predict_image)
+            # Compute intrinsics (must match SHARP's predict.py exactly)
             intrinsics = torch.tensor([
-                [f_px, 0, width / 2, 0],
-                [0, f_px, height / 2, 0],
+                [f_px, 0, (width - 1) / 2.0, 0],
+                [0, f_px, (height - 1) / 2.0, 0],
                 [0, 0, 1, 0],
                 [0, 0, 0, 1],
             ], dtype=torch.float32, device=self._device)
