@@ -1,6 +1,6 @@
 # Apple SHARP - FiftyOne Model Zoo Integration
 
-![sharp](https://cdn.voxel51.com/plugins/apple_sharp/sharp.gif)
+![image](sharp.gif)
 
 [SHARP](https://github.com/apple/ml-sharp) is Apple's state-of-the-art model for predicting 3D Gaussian Splats from a single RGB image. This integration brings SHARP to FiftyOne, enabling batch inference on image datasets with 3D visualization.
 
